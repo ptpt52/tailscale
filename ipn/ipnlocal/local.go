@@ -4258,7 +4258,7 @@ func (b *LocalBackend) checkExitNodePrefsLocked(p *ipn.Prefs) error {
 	}
 
 	if p.AdvertisesExitNode() {
-		return errors.New("Cannot advertise an exit node and use an exit node at the same time.")
+		b.logf("Let's try advertise an exit node and use an exit node at the same time.")
 	}
 	return nil
 }
