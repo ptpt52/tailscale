@@ -98,6 +98,8 @@ var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	NoSNAT                     bool
 	NoStatefulFiltering        opt.Bool
 	NetfilterMode              preftype.NetfilterMode
+	RouteMetric                int
+	RouteTable                 string
 	OperatorUser               string
 	ProfileName                string
 	AutoUpdate                 AutoUpdatePrefs

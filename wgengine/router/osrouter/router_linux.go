@@ -88,9 +88,9 @@ type linuxRouter struct {
 
 	// interfaceV6UsableMemo memoizes interfaceV6Usable for the duration of a
 	// single Set, so its many getV6Available calls don't each hit /proc. It's
-	// an atomic tri-state (see the memoV6 constants) because getV6Available is
-	// also reached, without holding mu, from the onIPRuleDeleted timer's
-	// justAddIPRules; the unset value there means "read live". See #20447.
+	// an atomic tri-state (see the memoV6 constants). getV6Available is also
+	// reached from the onIPRuleDeleted timer's justAddIPRules; the unset
+	// value outside Set means "read live". See #20447.
 	interfaceV6UsableMemo atomic.Int32
 
 	// ipPolicyPrefBase is the base priority at which ip rules are installed.
@@ -99,19 +99,25 @@ type linuxRouter struct {
 	cmd commandRunner
 	nfr linuxfw.NetfilterRunner
 
-	mu                sync.Mutex
-	addrs             map[netip.Prefix]bool
-	lastScanAddrs     set.Set[netip.Prefix] // desired addrs at the last successful orphan scan; nil until the first scan
-	routes            map[netip.Prefix]bool
-	localRoutes       map[netip.Prefix]bool
-	snatSubnetRoutes  bool
-	statefulFiltering bool
-	connmarkEnabled   bool // whether connmark rules are currently enabled
-	netfilterMode     preftype.NetfilterMode
-	netfilterKind     string
-	cgnatMode         linuxfw.CGNATMode
-	magicsockPortV4   uint16
-	magicsockPortV6   uint16
+	mu                  sync.Mutex
+	routeMetric         int
+	routeTableMain      bool
+	routeTableOverride  string // service setting: "", "52", or "main"
+	routeMetricOverride *int   // nil leaves the profile preference in control
+	routingConfigured   bool
+	policyRulesEnabled  bool // guarded by mu, including the rule restoration timer
+	addrs               map[netip.Prefix]bool
+	lastScanAddrs       set.Set[netip.Prefix] // desired addrs at the last successful orphan scan; nil until the first scan
+	routes              map[netip.Prefix]bool
+	localRoutes         map[netip.Prefix]bool
+	snatSubnetRoutes    bool
+	statefulFiltering   bool
+	connmarkEnabled     bool // whether connmark rules are currently enabled
+	netfilterMode       preftype.NetfilterMode
+	netfilterKind       string
+	cgnatMode           linuxfw.CGNATMode
+	magicsockPortV4     uint16
+	magicsockPortV6     uint16
 }
 
 func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Monitor, health *health.Tracker, bus *eventbus.Bus) (router.Router, error) {
@@ -128,6 +134,10 @@ func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Moni
 }
 
 func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon.Monitor, cmd commandRunner, health *health.Tracker, bus *eventbus.Bus) (router.Router, error) {
+	table, metric, err := linuxRouteOverridesFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	r := &linuxRouter{
 		logf:          logf,
 		tunname:       tunname,
@@ -137,8 +147,10 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon
 
 		cmd: cmd,
 
-		ipRuleFixLimiter: rate.NewLimiter(rate.Every(5*time.Second), 10),
-		ipPolicyPrefBase: 5200,
+		ipRuleFixLimiter:    rate.NewLimiter(rate.Every(5*time.Second), 10),
+		ipPolicyPrefBase:    5200,
+		routeTableOverride:  table,
+		routeMetricOverride: metric,
 	}
 	r.interfaceV6Usable = func() bool { return interfaceV6UsableForTun(r.tunname) }
 	ec := bus.Client("router-linux")
@@ -343,6 +355,12 @@ type AddIPRules struct{}
 // about the priority number. We could just do this in response to any netlink
 // change. Filtering by known priority ranges cuts back on some logspam.
 func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
+	r.mu.Lock()
+	enabled := r.policyRulesEnabled
+	r.mu.Unlock()
+	if !enabled || r.closed.Load() {
+		return
+	}
 	if int(priority) < r.ipPolicyPrefBase || int(priority) >= (r.ipPolicyPrefBase+100) {
 		// Not our rule.
 		return
@@ -360,7 +378,9 @@ func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
 	r.rulesAddedPub.Publish(AddIPRules{})
 
 	time.AfterFunc(rr.Delay()+250*time.Millisecond, func() {
-		if r.ruleRestorePending.Swap(false) && !r.closed.Load() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.ruleRestorePending.Swap(false) && !r.closed.Load() && r.policyRulesEnabled {
 			r.logf("somebody (likely systemd-networkd) deleted ip rules; restoring Tailscale's")
 			r.justAddIPRules()
 		}
@@ -373,8 +393,10 @@ func (r *linuxRouter) Up() error {
 	if err := r.setNetfilterModeLocked(netfilterOff); err != nil {
 		return fmt.Errorf("setting netfilter mode: %w", err)
 	}
-	if err := r.addIPRules(); err != nil {
-		return fmt.Errorf("adding IP rules: %w", err)
+	// Preferences are not available until Set. Remove stale rules now, and
+	// defer adding rules until we know whether the main table was selected.
+	if err := r.delIPRules(); err != nil {
+		return fmt.Errorf("removing stale IP rules: %w", err)
 	}
 	if err := r.upInterface(); err != nil {
 		return fmt.Errorf("bringing interface up: %w", err)
@@ -384,13 +406,15 @@ func (r *linuxRouter) Up() error {
 }
 
 func (r *linuxRouter) Close() error {
+	r.closed.Store(true)
+	// Closing the event client waits for callbacks, which can acquire mu.
+	// Drain them before taking the router lock.
+	r.eventClient.Close()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.closed.Store(true)
 	if r.unregNetMon != nil {
 		r.unregNetMon()
 	}
-	r.eventClient.Close()
 
 	// Clean up connmark rules
 	if err := r.nfr.DelConnmarkSaveRule(); err != nil {
@@ -441,9 +465,24 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 	// snapshotV6Usable runs now; the closure it returns (trailing ()) is
 	// deferred to clear the memo on return.
 	defer r.snapshotV6Usable()()
+	cfg = r.withRouteOverrides(cfg)
 	var errs []error
 	if cfg == nil {
-		cfg = &shutdownConfig
+		shutdown := shutdownConfig
+		shutdown.RouteMetric = r.routeMetric
+		if r.routeTableMain {
+			shutdown.RouteTable = "main"
+		}
+		cfg = &shutdown
+		// The engine also calls Set(nil) during construction, before the
+		// saved profile is available. It must not install default policy rules.
+		r.policyRulesEnabled = false
+		r.routingConfigured = false
+		if err := r.delIPRules(); err != nil {
+			errs = append(errs, err)
+		}
+	} else if err := r.reconfigureRouting(cfg); err != nil {
+		return err
 	}
 
 	if cfg.NetfilterKind != r.netfilterKind {
@@ -1198,11 +1237,31 @@ func (r *linuxRouter) addRoute(cidr netip.Prefix) error {
 	if err != nil {
 		return err
 	}
-	return netlink.RouteReplace(&netlink.Route{
-		LinkIndex: linkIndex,
-		Dst:       netipx.PrefixIPNet(cidr.Masked()),
-		Table:     r.routeTable(),
-	})
+	route := r.netlinkRoute(cidr, linkIndex, unix.RTN_UNICAST)
+	if !r.routeTableMain {
+		return netlink.RouteReplace(route)
+	}
+	// main is shared with LAN/WAN routes. Never replace another interface's
+	// route, even if its prefix and metric happen to match ours.
+	err = netlink.RouteAdd(route)
+	if errors.Is(err, errEEXIST) {
+		// Adopt an identical route left on a persistent tun by a prior daemon.
+		family := netlink.FAMILY_V4
+		if cidr.Addr().Is6() {
+			family = netlink.FAMILY_V6
+		}
+		routes, listErr := netlink.RouteListFiltered(family, route,
+			netlink.RT_FILTER_TABLE|netlink.RT_FILTER_DST|netlink.RT_FILTER_OIF|netlink.RT_FILTER_PRIORITY)
+		if listErr != nil {
+			return errors.Join(err, listErr)
+		}
+		for _, existing := range routes {
+			if existing.Type == unix.RTN_UNICAST && len(existing.Gw) == 0 && len(existing.MultiPath) == 0 {
+				return nil
+			}
+		}
+	}
+	return err
 }
 
 // addThrowRoute adds a throw route for the provided cidr.
@@ -1210,7 +1269,7 @@ func (r *linuxRouter) addRoute(cidr netip.Prefix) error {
 // pretending that no route was found. Fails if the route already exists,
 // or if adding the route fails.
 func (r *linuxRouter) addThrowRoute(cidr netip.Prefix) error {
-	if !r.ipRuleAvailable {
+	if !r.ipRuleAvailable || r.routeTableMain {
 		return nil
 	}
 	if !r.getV6Available() && cidr.Addr().Is6() {
@@ -1219,11 +1278,7 @@ func (r *linuxRouter) addThrowRoute(cidr netip.Prefix) error {
 	if r.useIPCommand() {
 		return r.addRouteDef([]string{"throw", normalizeCIDR(cidr)}, cidr)
 	}
-	err := netlink.RouteReplace(&netlink.Route{
-		Dst:   netipx.PrefixIPNet(cidr.Masked()),
-		Table: tailscaleRouteTable.Num,
-		Type:  unix.RTN_THROW,
-	})
+	err := netlink.RouteReplace(r.netlinkRoute(cidr, 0, unix.RTN_THROW))
 	if err != nil {
 		r.logf("THROW ERROR adding %v: %#v", cidr, err)
 	}
@@ -1235,9 +1290,7 @@ func (r *linuxRouter) addRouteDef(routeDef []string, cidr netip.Prefix) error {
 		return nil
 	}
 	args := append([]string{"ip", "route", "add"}, routeDef...)
-	if r.ipRuleAvailable {
-		args = append(args, "table", tailscaleRouteTable.ipCmdArg())
-	}
+	args = r.appendRouteArgs(args, cidr)
 	err := r.cmd.run(args...)
 	if err == nil {
 		return nil
@@ -1249,6 +1302,12 @@ func (r *linuxRouter) addRouteDef(routeDef []string, cidr netip.Prefix) error {
 	// LAN access, Issue 3060). Fortunately in the common case we
 	// use netlink directly instead and don't exercise this code.
 	if errCode(err) == 2 && strings.Contains(err.Error(), "RTNETLINK answers: File exists") {
+		if r.routeTableMain {
+			// Only adopt our own matching route, never a conflicting LAN route.
+			if exists, checkErr := r.hasRoute(routeDef, cidr); checkErr != nil || !exists {
+				return errors.Join(err, checkErr)
+			}
+		}
 		r.logf("ignoring route add of %v; already exists", cidr)
 		return nil
 	}
@@ -1275,11 +1334,7 @@ func (r *linuxRouter) delRoute(cidr netip.Prefix) error {
 	if err != nil {
 		return err
 	}
-	err = netlink.RouteDel(&netlink.Route{
-		LinkIndex: linkIndex,
-		Dst:       netipx.PrefixIPNet(cidr.Masked()),
-		Table:     r.routeTable(),
-	})
+	err = netlink.RouteDel(r.netlinkRoute(cidr, linkIndex, unix.RTN_UNICAST))
 	if errors.Is(err, errESRCH) {
 		// Didn't exist to begin with.
 		return nil
@@ -1290,7 +1345,7 @@ func (r *linuxRouter) delRoute(cidr netip.Prefix) error {
 // delThrowRoute removes the throw route for the cidr. Fails if the route
 // doesn't exist, or if removing the route fails.
 func (r *linuxRouter) delThrowRoute(cidr netip.Prefix) error {
-	if !r.ipRuleAvailable {
+	if !r.ipRuleAvailable || r.routeTableMain {
 		return nil
 	}
 	if !r.getV6Available() && cidr.Addr().Is6() {
@@ -1299,11 +1354,7 @@ func (r *linuxRouter) delThrowRoute(cidr netip.Prefix) error {
 	if r.useIPCommand() {
 		return r.delRouteDef([]string{"throw", normalizeCIDR(cidr)}, cidr)
 	}
-	err := netlink.RouteDel(&netlink.Route{
-		Dst:   netipx.PrefixIPNet(cidr.Masked()),
-		Table: r.routeTable(),
-		Type:  unix.RTN_THROW,
-	})
+	err := netlink.RouteDel(r.netlinkRoute(cidr, 0, unix.RTN_THROW))
 	if errors.Is(err, errESRCH) {
 		// Didn't exist to begin with.
 		return nil
@@ -1316,9 +1367,7 @@ func (r *linuxRouter) delRouteDef(routeDef []string, cidr netip.Prefix) error {
 		return nil
 	}
 	args := append([]string{"ip", "route", "del"}, routeDef...)
-	if r.ipRuleAvailable {
-		args = append(args, "table", tailscaleRouteTable.ipCmdArg())
-	}
+	args = r.appendRouteArgs(args, cidr)
 	err := r.cmd.run(args...)
 	if err != nil {
 		ok, err := r.hasRoute(routeDef, cidr)
@@ -1343,9 +1392,7 @@ func dashFam(ip netip.Addr) string {
 
 func (r *linuxRouter) hasRoute(routeDef []string, cidr netip.Prefix) (bool, error) {
 	args := append([]string{"ip", dashFam(cidr.Addr()), "route", "show"}, routeDef...)
-	if r.ipRuleAvailable {
-		args = append(args, "table", tailscaleRouteTable.ipCmdArg())
-	}
+	args = r.appendRouteArgs(args, cidr)
 	out, err := r.cmd.output(args...)
 	if err != nil {
 		return false, err
@@ -1373,10 +1420,122 @@ func (r *linuxRouter) linkIndex() (int, error) {
 
 // routeTable returns the route table to use.
 func (r *linuxRouter) routeTable() int {
+	if r.routeTableMain {
+		return mainRouteTable.Num
+	}
 	if r.ipRuleAvailable {
 		return tailscaleRouteTable.Num
 	}
 	return 0
+}
+
+func (r *linuxRouter) routePriority(cidr netip.Prefix) int {
+	if r.routeMetric == 0 && cidr.Addr().Is6() {
+		return 1024 // Linux normalizes an IPv6 metric of zero to 1024.
+	}
+	return r.routeMetric
+}
+
+func (r *linuxRouter) netlinkRoute(cidr netip.Prefix, linkIndex, routeType int) *netlink.Route {
+	return &netlink.Route{
+		LinkIndex: linkIndex,
+		Dst:       netipx.PrefixIPNet(cidr.Masked()),
+		Table:     r.routeTable(),
+		Type:      routeType,
+		Priority:  r.routePriority(cidr),
+	}
+}
+
+func (r *linuxRouter) appendRouteArgs(args []string, cidr netip.Prefix) []string {
+	if r.routeTableMain {
+		args = append(args, "table", "main")
+	} else if r.ipRuleAvailable {
+		args = append(args, "table", tailscaleRouteTable.ipCmdArg())
+	}
+	if r.routeMetric != 0 || r.routeTableMain {
+		args = append(args, "metric", strconv.Itoa(r.routePriority(cidr)))
+	}
+	return args
+}
+
+// linuxRouteOverridesFromEnv reads service-level routing settings before any
+// routes can be installed. An unset variable leaves that profile preference
+// unchanged. OpenWrt uses these to apply UCI configuration without a later
+// LocalAPI call that could briefly enable policy routing from a saved profile.
+func linuxRouteOverridesFromEnv() (table string, metric *int, err error) {
+	table = envknob.String("TS_ROUTE_TABLE")
+	switch table {
+	case "", "52", "main":
+	default:
+		return "", nil, fmt.Errorf("TS_ROUTE_TABLE must be 52 or main, got %q", table)
+	}
+	if value := envknob.String("TS_ROUTE_METRIC"); value != "" {
+		n, err := strconv.ParseInt(value, 10, 32)
+		if err != nil || n < 0 {
+			return "", nil, fmt.Errorf("TS_ROUTE_METRIC must be between 0 and 2147483647, got %q", value)
+		}
+		metric = new(int(n))
+	}
+	return table, metric, nil
+}
+
+func (r *linuxRouter) withRouteOverrides(cfg *router.Config) *router.Config {
+	if cfg == nil || (r.routeTableOverride == "" && r.routeMetricOverride == nil) {
+		return cfg
+	}
+	cfg = cfg.Clone()
+	switch r.routeTableOverride {
+	case "52":
+		cfg.RouteTable = ""
+	case "main":
+		cfg.RouteTable = "main"
+	}
+	if r.routeMetricOverride != nil {
+		cfg.RouteMetric = *r.routeMetricOverride
+	}
+	return cfg
+}
+
+// reconfigureRouting runs under mu before reconciling prefixes. Delete routes
+// with their old table and metric first. On failure, retain the old settings
+// and the remaining routes so the next Set can retry cleanup accurately.
+func (r *linuxRouter) reconfigureRouting(cfg *router.Config) error {
+	if cfg.RouteMetric < 0 || cfg.RouteMetric > 1<<31-1 {
+		return errors.New("invalid Linux route metric")
+	}
+	if cfg.RouteTable != "" && cfg.RouteTable != "main" {
+		return errors.New("invalid Linux route table")
+	}
+	main := cfg.RouteTable == "main"
+	if r.routingConfigured && r.routeMetric == cfg.RouteMetric && r.routeTableMain == main &&
+		r.policyRulesEnabled == (!main && r.ipRuleAvailable) {
+		return nil
+	}
+	if main {
+		r.policyRulesEnabled = false
+		if err := r.delIPRules(); err != nil {
+			return fmt.Errorf("removing IP rules for main table: %w", err)
+		}
+	}
+	var routeErr, throwErr error
+	r.routes, routeErr = cidrDiff("route", r.routes, nil, r.addRoute, r.delRoute, r.logf)
+	r.localRoutes, throwErr = cidrDiff("localRoute", r.localRoutes, nil, r.addThrowRoute, r.delThrowRoute, r.logf)
+	if err := errors.Join(routeErr, throwErr); err != nil {
+		return fmt.Errorf("removing routes before changing table or metric: %w", err)
+	}
+	r.routeMetric = cfg.RouteMetric
+	r.routeTableMain = main
+	// A failed rule installation must be retried, even though the new route
+	// settings have already been selected.
+	r.routingConfigured = false
+	if !main {
+		if err := r.addIPRules(); err != nil {
+			return fmt.Errorf("adding IP rules: %w", err)
+		}
+	}
+	r.policyRulesEnabled = !main && r.ipRuleAvailable
+	r.routingConfigured = true
+	return nil
 }
 
 // upInterface brings up the tunnel interface.
@@ -1503,7 +1662,7 @@ func (r *linuxRouter) addrFamilies() []addrFamily {
 // routing loops. If the rule exists and appears to be a
 // tailscale-managed rule, it is gracefully replaced.
 func (r *linuxRouter) addIPRules() error {
-	if !r.ipRuleAvailable {
+	if !r.ipRuleAvailable || r.routeTableMain {
 		return nil
 	}
 
@@ -1657,7 +1816,7 @@ func ipRules() []netlink.Rule {
 
 // justAddIPRules adds policy routing rule without deleting any first.
 func (r *linuxRouter) justAddIPRules() error {
-	if !r.ipRuleAvailable {
+	if !r.ipRuleAvailable || r.routeTableMain {
 		return nil
 	}
 	if r.useIPCommand() {
@@ -1720,15 +1879,13 @@ func (r *linuxRouter) addIPRulesWithIPCommand() error {
 	return rg.ErrAcc
 }
 
-// delRoutes removes any local routes that we added that would not be
-// cleaned up on interface down.
+// delRoutes removes routes explicitly managed by this instance, including
+// routes in the shared main table. Never flush a table shared with the host.
 func (r *linuxRouter) delRoutes() error {
-	for rt := range r.localRoutes {
-		if err := r.delThrowRoute(rt); err != nil {
-			r.logf("failed to delete throw route(%q): %v", rt, err)
-		}
-	}
-	return nil
+	var routeErr, throwErr error
+	r.routes, routeErr = cidrDiff("route", r.routes, nil, r.addRoute, r.delRoute, r.logf)
+	r.localRoutes, throwErr = cidrDiff("localRoute", r.localRoutes, nil, r.addThrowRoute, r.delThrowRoute, r.logf)
+	return errors.Join(routeErr, throwErr)
 }
 
 // delIPRules removes the policy routing rules that avoid

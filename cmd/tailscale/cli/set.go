@@ -67,6 +67,8 @@ type setArgsT struct {
 	statefulFiltering          bool
 	sync                       bool
 	netfilterMode              string
+	routeMetric                int
+	routeTable                 string
 	relayServerPort            string
 	relayServerStaticEndpoints string
 }
@@ -114,6 +116,8 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	}
 	switch goos {
 	case "linux":
+		setf.IntVar(&setArgs.routeMetric, "route-metric", 0, "metric for Tailscale routes (0 uses the kernel default; higher values have lower priority)")
+		setf.StringVar(&setArgs.routeTable, "route-table", "52", "routing table (52 uses policy rules; main installs no policy rules)")
 		setf.BoolVar(&setArgs.snat, "snat-subnet-routes", true, "source NAT traffic to local routes advertised with --advertise-routes")
 		setf.BoolVar(&setArgs.statefulFiltering, "stateful-filtering", false, "apply stateful filtering to forwarded packets (subnet routers, exit nodes, and so on)")
 		setf.StringVar(&setArgs.netfilterMode, "netfilter-mode", defaultNetfilterMode(), "netfilter mode (one of on, nodivert, off)")
@@ -173,6 +177,9 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 	}
 
 	if effectiveGOOS() == "linux" {
+		if err := setRoutePrefs(&maskedPrefs.Prefs, setArgs.routeMetric, setArgs.routeTable); err != nil {
+			return err
+		}
 		nfMode, warning, err := netfilterModeFromFlag(setArgs.netfilterMode)
 		if err != nil {
 			return err

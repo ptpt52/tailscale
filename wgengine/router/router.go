@@ -136,6 +136,8 @@ type Config struct {
 	SNATSubnetRoutes bool
 
 	// Linux-only things below, ignored on other platforms.
+	RouteMetric         int                    // metric for explicitly managed routes; zero uses the kernel default
+	RouteTable          string                 // "" for table 52 with policy rules; "main" for main without policy rules
 	StatefulFiltering   bool                   // Apply stateful filtering to inbound connections
 	NetfilterMode       preftype.NetfilterMode // how much to manage netfilter rules
 	NetfilterKind       string                 // what kind of netfilter to use ("nftables", "iptables", or "" to auto-detect)

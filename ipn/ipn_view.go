@@ -409,6 +409,15 @@ func (v PrefsView) NoStatefulFiltering() opt.Bool { return v.ж.NoStatefulFilter
 // Tailscale, if at all.
 func (v PrefsView) NetfilterMode() preftype.NetfilterMode { return v.ж.NetfilterMode }
 
+// RouteMetric is the metric for Linux routes managed by Tailscale.
+// Zero preserves the kernel default (0 for IPv4, 1024 for IPv6).
+// Values are limited to signed 32-bit integers for 32-bit Linux systems.
+func (v PrefsView) RouteMetric() int { return v.ж.RouteMetric }
+
+// RouteTable selects Linux routing: "" uses table 52 and policy rules;
+// "main" uses the main table without installing policy rules or throw routes.
+func (v PrefsView) RouteTable() string { return v.ж.RouteTable }
+
 // OperatorUser is the local machine user name who is allowed to
 // operate tailscaled without being root or using sudo.
 func (v PrefsView) OperatorUser() string { return v.ж.OperatorUser }
@@ -515,6 +524,8 @@ var _PrefsViewNeedsRegeneration = Prefs(struct {
 	NoSNAT                     bool
 	NoStatefulFiltering        opt.Bool
 	NetfilterMode              preftype.NetfilterMode
+	RouteMetric                int
+	RouteTable                 string
 	OperatorUser               string
 	ProfileName                string
 	AutoUpdate                 AutoUpdatePrefs
