@@ -33,6 +33,40 @@ func fieldsOf(t reflect.Type) (fields []string) {
 	return
 }
 
+func TestCheckRoutePrefs(t *testing.T) {
+	for _, tc := range []struct {
+		prefs Prefs
+		valid bool
+	}{
+		{Prefs{}, true},
+		{Prefs{RouteTable: "main", RouteMetric: 4096}, true},
+		{Prefs{RouteMetric: -1}, false},
+		{Prefs{RouteTable: "100"}, false},
+		{Prefs{RouteMetric: 1<<31 - 1}, true},
+	} {
+		if err := tc.prefs.CheckRoutePrefs(); (err == nil) != tc.valid {
+			t.Errorf("CheckRoutePrefs(%+v) = %v", tc.prefs, err)
+		}
+	}
+	// Persisted settings survive profile serialization and masked edits.
+	p := Prefs{RouteTable: "main", RouteMetric: 4096}
+	data, err := json.Marshal(&p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loaded Prefs
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatal(err)
+	}
+	if !p.Equals(&loaded) {
+		t.Fatal("route preferences lost on reload")
+	}
+	loaded.ApplyEdits(&MaskedPrefs{Prefs: Prefs{RouteMetric: 8192}, RouteMetricSet: true})
+	if loaded.RouteTable != "main" || loaded.RouteMetric != 8192 || p.Equals(&loaded) {
+		t.Fatal("route preference edit or equality check failed")
+	}
+}
+
 func TestPrefsEqual(t *testing.T) {
 	tstest.PanicOnLog()
 
@@ -61,6 +95,8 @@ func TestPrefsEqual(t *testing.T) {
 		"NoSNAT",
 		"NoStatefulFiltering",
 		"NetfilterMode",
+		"RouteMetric",
+		"RouteTable",
 		"OperatorUser",
 		"ProfileName",
 		"AutoUpdate",

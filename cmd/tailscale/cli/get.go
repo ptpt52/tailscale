@@ -186,6 +186,10 @@ func prefValue(flagName string, prefs *ipn.Prefs, st *ipnstate.Status) any {
 		return true
 	case "netfilter-mode":
 		return prefs.NetfilterMode.String()
+	case "route-metric":
+		return prefs.RouteMetric
+	case "route-table":
+		return prefs.RouteTableName()
 	case "unattended":
 		return prefs.ForceDaemon
 	case "sync":

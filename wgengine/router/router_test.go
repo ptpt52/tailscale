@@ -14,7 +14,7 @@ import (
 func TestConfigEqual(t *testing.T) {
 	testedFields := []string{
 		"LocalAddrs", "Routes", "LocalRoutes", "NewMTU",
-		"SubnetRoutes", "SNATSubnetRoutes", "StatefulFiltering",
+		"SubnetRoutes", "SNATSubnetRoutes", "RouteMetric", "RouteTable", "StatefulFiltering",
 		"NetfilterMode", "NetfilterKind", "RemoveCGNATDropRule",
 	}
 	configType := reflect.TypeFor[Config]()

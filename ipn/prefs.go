@@ -245,6 +245,15 @@ type Prefs struct {
 	// Tailscale, if at all.
 	NetfilterMode preftype.NetfilterMode
 
+	// RouteMetric is the metric for Linux routes managed by Tailscale.
+	// Zero preserves the kernel default (0 for IPv4, 1024 for IPv6).
+	// Values are limited to signed 32-bit integers for 32-bit Linux systems.
+	RouteMetric int `json:",omitempty"`
+
+	// RouteTable selects Linux routing: "" uses table 52 and policy rules;
+	// "main" uses the main table without installing policy rules or throw routes.
+	RouteTable string `json:",omitempty"`
+
 	// OperatorUser is the local machine user name who is allowed to
 	// operate tailscaled without being root or using sudo.
 	OperatorUser string `json:",omitempty"`
@@ -380,6 +389,8 @@ type MaskedPrefs struct {
 	NoSNATSet                     bool                `json:",omitempty"`
 	NoStatefulFilteringSet        bool                `json:",omitempty"`
 	NetfilterModeSet              bool                `json:",omitempty"`
+	RouteMetricSet                bool                `json:",omitempty"`
+	RouteTableSet                 bool                `json:",omitempty"`
 	OperatorUserSet               bool                `json:",omitempty"`
 	ProfileNameSet                bool                `json:",omitempty"`
 	AutoUpdateSet                 AutoUpdatePrefsMask `json:",omitzero"`
@@ -543,9 +554,33 @@ func (p *Prefs) IsEmpty() bool { return p == nil || p.Equals(&Prefs{}) }
 func (p PrefsView) Pretty() string { return p.ж.Pretty() }
 
 func (p *Prefs) Pretty() string { return p.pretty(runtime.GOOS) }
+
+// CheckRoutePrefs validates the Linux routing preferences, including values
+// received through LocalAPI rather than the command line.
+func (p *Prefs) CheckRoutePrefs() error {
+	if p.RouteMetric < 0 || p.RouteMetric > 1<<31-1 {
+		return errors.New("--route-metric must be between 0 and 2147483647")
+	}
+	if p.RouteTable != "" && p.RouteTable != "main" {
+		return errors.New("--route-table must be 52 or main")
+	}
+	return nil
+}
+
+// RouteTableName returns the command-line name of the selected Linux table.
+func (p *Prefs) RouteTableName() string {
+	if p.RouteTable == "" {
+		return "52"
+	}
+	return p.RouteTable
+}
+
 func (p *Prefs) pretty(goos string) string {
 	var sb strings.Builder
 	sb.WriteString("Prefs{")
+	if goos == "linux" && (p.RouteMetric != 0 || p.RouteTable != "") {
+		fmt.Fprintf(&sb, "route-table=%s route-metric=%d ", p.RouteTableName(), p.RouteMetric)
+	}
 	if buildfeatures.HasUseRoutes {
 		fmt.Fprintf(&sb, "ra=%v ", p.RouteAll)
 	}
@@ -685,6 +720,8 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.NoSNAT == p2.NoSNAT &&
 		p.NoStatefulFiltering == p2.NoStatefulFiltering &&
 		p.NetfilterMode == p2.NetfilterMode &&
+		p.RouteMetric == p2.RouteMetric &&
+		p.RouteTable == p2.RouteTable &&
 		p.OperatorUser == p2.OperatorUser &&
 		p.Hostname == p2.Hostname &&
 		p.ForceDaemon == p2.ForceDaemon &&

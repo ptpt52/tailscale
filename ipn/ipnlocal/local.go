@@ -5088,6 +5088,9 @@ func (b *LocalBackend) checkPrefsLocked(p *ipn.Prefs) error {
 		// Keep this one just for testing.
 		errs = append(errs, errors.New("bad hostname [test]"))
 	}
+	if err := p.CheckRoutePrefs(); err != nil {
+		errs = append(errs, err)
+	}
 	if err := b.checkProfileNameLocked(p); err != nil {
 		errs = append(errs, err)
 	}
@@ -6682,6 +6685,8 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 		SNATSubnetRoutes:    !prefs.NoSNAT(),
 		StatefulFiltering:   doStatefulFiltering,
 		NetfilterMode:       prefs.NetfilterMode(),
+		RouteMetric:         prefs.RouteMetric(),
+		RouteTable:          prefs.RouteTable(),
 		Routes:              b.currentNode().osRoutes(),
 		NetfilterKind:       netfilterKind,
 		RemoveCGNATDropRule: nm.HasCap(nodecap.DisableLinuxCGNATDropRule),

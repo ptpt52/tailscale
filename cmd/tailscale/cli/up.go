@@ -125,6 +125,8 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	}
 	switch goos {
 	case "linux":
+		upf.IntVar(&upArgs.routeMetric, "route-metric", 0, "metric for Tailscale routes (0 uses the kernel default; higher values have lower priority)")
+		upf.StringVar(&upArgs.routeTable, "route-table", "52", "routing table (52 uses policy rules; main installs no policy rules)")
 		upf.BoolVar(&upArgs.snat, "snat-subnet-routes", true, "source NAT traffic to local routes advertised with --advertise-routes")
 		upf.BoolVar(&upArgs.statefulFiltering, "stateful-filtering", false, "apply stateful filtering to forwarded packets (subnet routers, exit nodes, and so on)")
 		upf.StringVar(&upArgs.netfilterMode, "netfilter-mode", defaultNetfilterMode(), "netfilter mode (one of on, nodivert, off)")
@@ -172,9 +174,19 @@ func defaultNetfilterMode() string {
 	return "on"
 }
 
+func setRoutePrefs(p *ipn.Prefs, metric int, table string) error {
+	p.RouteMetric = metric
+	if table == "52" {
+		table = ""
+	}
+	p.RouteTable = table
+	return p.CheckRoutePrefs()
+}
+
 // upArgsT is the type of upArgs, the argument struct for `tailscale up`.
 // As of 2024-10-08, upArgsT is frozen and no new arguments should be
 // added to it. Add new arguments to setArgsT instead.
+// This fork also exposes its Linux route preferences for initial setup.
 type upArgsT struct {
 	qr                     bool
 	qrFormat               string
@@ -196,6 +208,8 @@ type upArgsT struct {
 	snat                   bool
 	statefulFiltering      bool
 	netfilterMode          string
+	routeMetric            int
+	routeTable             string
 	authKeyOrFile          string // "secret" or "file:/path/to/secret"
 	clientID               string
 	audience               string
@@ -372,6 +386,9 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 		}
 	}
 	if goos == "linux" {
+		if err := setRoutePrefs(prefs, upArgs.routeMetric, upArgs.routeTable); err != nil {
+			return nil, err
+		}
 		// Backfills for NoStatefulFiltering occur when loading a profile; just set it explicitly here.
 		prefs.NoStatefulFiltering.Set(!upArgs.statefulFiltering)
 		v, warning, err := netfilterModeFromFlag(upArgs.netfilterMode)
@@ -953,6 +970,8 @@ func init() {
 	addPrefFlagMapping("hostname", "Hostname")
 	addPrefFlagMapping("login-server", "ControlURL")
 	addPrefFlagMapping("netfilter-mode", "NetfilterMode")
+	addPrefFlagMapping("route-metric", "RouteMetric")
+	addPrefFlagMapping("route-table", "RouteTable")
 	addPrefFlagMapping("shields-up", "ShieldsUp")
 	addPrefFlagMapping("snat-subnet-routes", "NoSNAT")
 	addPrefFlagMapping("stateful-filtering", "NoStatefulFiltering")
@@ -1162,7 +1181,7 @@ func applyImplicitPrefs(prefs, oldPrefs *ipn.Prefs, env upCheckEnv) {
 
 func flagAppliesToOS(flag, goos string) bool {
 	switch flag {
-	case "netfilter-mode", "stateful-filtering":
+	case "netfilter-mode", "stateful-filtering", "route-metric", "route-table":
 		return goos == "linux"
 	case "snat-subnet-routes":
 		return goos == "linux" || goos == "freebsd"
@@ -1249,6 +1268,10 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
 			}
 		case "netfilter-mode":
 			set(prefs.NetfilterMode.String())
+		case "route-metric":
+			set(prefs.RouteMetric)
+		case "route-table":
+			set(prefs.RouteTableName())
 		case "unattended":
 			set(prefs.ForceDaemon)
 		case "report-posture":

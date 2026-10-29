@@ -14,7 +14,10 @@ import (
 // command is frozen: no new preferences can be added. Instead, add them to
 // tailscale set.
 // See tailscale/tailscale#15460.
+// This fork additionally permits its Linux route preferences.
 var validUpFlags = set.Of(
+	"route-metric",
+	"route-table",
 	"accept-dns",
 	"accept-risk",
 	"accept-routes",

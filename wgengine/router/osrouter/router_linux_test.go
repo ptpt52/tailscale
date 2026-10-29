@@ -58,7 +58,7 @@ ip rule add -6 pref 5270 table 52
 			name: "no-config",
 			in:   nil,
 			want: `
-up` + basic,
+up`,
 		},
 		{
 			name: "local-addr-only",
@@ -1146,7 +1146,17 @@ func (o *fakeOS) run(args ...string) error {
 	case "del":
 		found := false
 		for i, el := range *ls {
-			if el == rest {
+			match := el == rest
+			if args[1] == "rule" && !match {
+				// Real rule deletion matches the supplied selectors; cleanup
+				// deliberately omits fwmark so it can remove older rules too.
+				fields := strings.Fields(el)
+				if mark := slices.Index(fields, "fwmark"); mark >= 0 {
+					fields = slices.Delete(fields, mark, mark+2)
+				}
+				match = strings.Join(fields, " ") == rest
+			}
+			if match {
 				found = true
 				*ls = append((*ls)[:i], (*ls)[i+1:]...)
 				break
@@ -1176,6 +1186,13 @@ func (o *fakeOS) run(args ...string) error {
 
 func (o *fakeOS) output(args ...string) ([]byte, error) {
 	got := strings.Join(args, " ")
+	if len(args) > 4 && (args[1] == "-4" || args[1] == "-6") && args[2] == "route" && args[3] == "show" {
+		want := strings.Join(args[4:], " ")
+		if slices.Contains(o.routes, want) {
+			return []byte(want), nil
+		}
+		return nil, nil
+	}
 
 	if dev, ok := strings.CutPrefix(got, "ip -oneline addr show dev "); ok {
 		// Render o.ips (entries look like "<cidr> dev <ifname>") in a simplified
@@ -1282,6 +1299,7 @@ func TestRuleDeletedEvent(t *testing.T) {
 	fake := NewFakeOS(t)
 	lt, bus := newLinuxRootTest(t)
 	lt.r.nfr = fake.nfr
+	lt.r.policyRulesEnabled = true
 	defer lt.Close()
 	event := netmon.RuleDeleted{
 		Table:    52,
